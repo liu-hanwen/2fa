@@ -6,9 +6,9 @@
 //
 // Usage:
 //
-//     2fa -add [-7] [-8] [-hotp] name
+//     2fa -add [-7] [-8] [-hotp] [--key KEY] name
 //     2fa -list
-//     2fa [-clip] name
+//     2fa [-clip] [--key KEY] name
 //
 // "2fa -add name" adds a new key to the 2fa keychain with the given name.
 // It prints a prompt to standard error and reads a two-factor key from standard input.
@@ -33,12 +33,18 @@
 // the key and the current time, so it is important that the system clock have
 // at least one-minute accuracy.
 //
-// The keychain is stored unencrypted in the text file $HOME/.2fa.
+// The keychain is stored in the text file $HOME/.2fa. When --key is provided,
+// 2FA secrets are encrypted with AES-256-GCM using the supplied key; otherwise
+// secrets are stored in plaintext.
 
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
 use clap::Parser;
-use data_encoding::BASE32;
+use data_encoding::{BASE32, BASE64};
 use hmac::{Hmac, Mac};
+use rand::RngCore;
 use sha1::Sha1;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::fs::OpenOptions;
@@ -50,6 +56,8 @@ use std::time::SystemTime;
 type HmacSha1 = Hmac<Sha1>;
 
 const COUNTER_LEN: usize = 20;
+const NONCE_LEN: usize = 12;
+const ENC_PREFIX: &str = "enc:";
 
 #[derive(Parser)]
 #[command(name = "2fa", about = "two-factor authentication agent")]
@@ -78,15 +86,19 @@ struct Cli {
     #[arg(long = "clip")]
     clip: bool,
 
+    /// Encryption key: when provided, 2FA secrets are encrypted with AES-256-GCM
+    #[arg(long = "key")]
+    key: Option<String>,
+
     /// Key name
     name: Option<String>,
 }
 
 fn usage() -> ! {
     eprintln!("usage:");
-    eprintln!("\t2fa -add [-7] [-8] [-hotp] keyname");
-    eprintln!("\t2fa -list");
-    eprintln!("\t2fa [-clip] keyname");
+    eprintln!("\t2fa --add [-7] [-8] [--hotp] [--key KEY] keyname");
+    eprintln!("\t2fa --list");
+    eprintln!("\t2fa [--clip] [--key KEY] keyname");
     process::exit(2);
 }
 
@@ -97,7 +109,8 @@ fn main() {
         log_fatal("HOME environment variable not set");
     });
     let file = PathBuf::from(home).join(".2fa");
-    let mut k = read_keychain(&file);
+    let enc_key = cli.key.as_deref().map(derive_key);
+    let mut k = read_keychain(&file, enc_key.as_ref());
 
     if cli.list {
         if cli.name.is_some() {
@@ -124,7 +137,7 @@ fn main() {
         if cli.clip {
             usage();
         }
-        k.add(&name, cli.seven, cli.eight, cli.hotp);
+        k.add(&name, cli.seven, cli.eight, cli.hotp, enc_key.as_ref());
         return;
     }
     k.show(&name, cli.clip);
@@ -133,6 +146,43 @@ fn main() {
 fn log_fatal(msg: &str) -> ! {
     eprintln!("2fa: {}", msg);
     process::exit(1);
+}
+
+/// Derive a 32-byte AES-256 key from the user-supplied key string via SHA-256.
+fn derive_key(user_key: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(user_key.as_bytes());
+    hasher.finalize().into()
+}
+
+/// Encrypt `plaintext` with AES-256-GCM using `key`.
+/// Returns `enc:<base64(nonce || ciphertext_with_tag)>`.
+fn encrypt_secret(plaintext: &str, key: &[u8; 32]) -> String {
+    let cipher = Aes256Gcm::new_from_slice(key).expect("AES-256-GCM key must be 32 bytes");
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext.as_bytes())
+        .expect("encryption failure");
+    let mut combined = nonce_bytes.to_vec();
+    combined.extend_from_slice(&ciphertext);
+    format!("{}{}", ENC_PREFIX, BASE64.encode(&combined))
+}
+
+/// Decrypt an `enc:<base64>` secret produced by `encrypt_secret`.
+/// Returns `None` if `stored` does not have the `enc:` prefix or decryption fails.
+fn decrypt_secret(stored: &str, key: &[u8; 32]) -> Option<String> {
+    let b64 = stored.strip_prefix(ENC_PREFIX)?;
+    let combined = BASE64.decode(b64.as_bytes()).ok()?;
+    if combined.len() < NONCE_LEN {
+        return None;
+    }
+    let (nonce_bytes, ciphertext) = combined.split_at(NONCE_LEN);
+    let nonce = Nonce::from_slice(nonce_bytes);
+    let cipher = Aes256Gcm::new_from_slice(key).expect("AES-256-GCM key must be 32 bytes");
+    let plaintext = cipher.decrypt(nonce, ciphertext).ok()?;
+    String::from_utf8(plaintext).ok()
 }
 
 struct Key {
@@ -147,7 +197,7 @@ struct Keychain {
     keys: BTreeMap<String, Key>,
 }
 
-fn read_keychain(file: &PathBuf) -> Keychain {
+fn read_keychain(file: &PathBuf, enc_key: Option<&[u8; 32]>) -> Keychain {
     let mut c = Keychain {
         file: file.clone(),
         data: Vec::new(),
@@ -194,7 +244,24 @@ fn read_keychain(file: &PathBuf) -> Keychain {
         {
             let name = String::from_utf8_lossy(fields[0]).to_string();
             let digits = (fields[1][0] - b'0') as usize;
-            let key_str = String::from_utf8_lossy(fields[2]).to_string();
+            let secret_str = String::from_utf8_lossy(fields[2]).to_string();
+
+            // Resolve the actual base32 key, decrypting if necessary.
+            let key_str = if let Some(k) = enc_key {
+                if secret_str.starts_with(ENC_PREFIX) {
+                    match decrypt_secret(&secret_str, k) {
+                        Some(s) => s,
+                        None => {
+                            eprintln!("2fa: {}:{}: failed to decrypt key", file.display(), lineno);
+                            continue;
+                        }
+                    }
+                } else {
+                    secret_str.clone()
+                }
+            } else {
+                secret_str.clone()
+            };
 
             if let Ok(raw) = decode_key(&key_str) {
                 if fields.len() == 3 {
@@ -243,7 +310,7 @@ impl Keychain {
         }
     }
 
-    fn add(&self, name: &str, flag7: bool, flag8: bool, flag_hotp: bool) {
+    fn add(&self, name: &str, flag7: bool, flag8: bool, flag_hotp: bool, enc_key: Option<&[u8; 32]>) {
         let size = if flag7 {
             if flag8 {
                 log_fatal("cannot use -7 and -8 together");
@@ -273,7 +340,13 @@ impl Keychain {
             log_fatal("invalid key");
         }
 
-        let mut line = format!("{} {} {}", name, size, text);
+        // Encrypt the secret if an encryption key is provided; otherwise store plaintext.
+        let stored_secret = match enc_key {
+            Some(k) => encrypt_secret(&text, k),
+            None => text,
+        };
+
+        let mut line = format!("{} {} {}", name, size, stored_secret);
         if flag_hotp {
             line.push(' ');
             line.push_str(&"0".repeat(20));
@@ -374,7 +447,7 @@ fn decode_key(key: &str) -> Result<Vec<u8>, data_encoding::DecodeError> {
 }
 
 fn hotp(key: &[u8], counter: u64, digits: usize) -> u32 {
-    let mut mac = HmacSha1::new_from_slice(key).expect("HMAC can take key of any size");
+    let mut mac = <HmacSha1 as KeyInit>::new_from_slice(key).expect("HMAC can take key of any size");
     mac.update(&counter.to_be_bytes());
     let sum = mac.finalize().into_bytes();
     let offset = (sum[sum.len() - 1] & 0x0F) as usize;
@@ -466,7 +539,7 @@ mod tests {
         let dir = std::env::temp_dir().join("test_2fa_empty");
         let _ = fs::remove_file(&dir);
         fs::write(&dir, "").unwrap();
-        let kc = read_keychain(&dir);
+        let kc = read_keychain(&dir, None);
         assert!(kc.keys.is_empty());
         let _ = fs::remove_file(&dir);
     }
@@ -477,7 +550,7 @@ mod tests {
         let _ = fs::remove_file(&dir);
         // JBSWY3DPEHPK3PXP is a valid base32 key
         fs::write(&dir, "github 6 JBSWY3DPEHPK3PXP\n").unwrap();
-        let kc = read_keychain(&dir);
+        let kc = read_keychain(&dir, None);
         assert!(kc.keys.contains_key("github"));
         let k = kc.keys.get("github").unwrap();
         assert_eq!(k.digits, 6);
@@ -491,7 +564,7 @@ mod tests {
         let _ = fs::remove_file(&dir);
         let content = format!("mykey 6 JBSWY3DPEHPK3PXP {}\n", "0".repeat(COUNTER_LEN));
         fs::write(&dir, &content).unwrap();
-        let kc = read_keychain(&dir);
+        let kc = read_keychain(&dir, None);
         assert!(kc.keys.contains_key("mykey"));
         let k = kc.keys.get("mykey").unwrap();
         assert_eq!(k.digits, 6);
@@ -503,7 +576,7 @@ mod tests {
     fn test_read_keychain_nonexistent() {
         let dir = std::env::temp_dir().join("test_2fa_nonexistent_xyz");
         let _ = fs::remove_file(&dir);
-        let kc = read_keychain(&dir);
+        let kc = read_keychain(&dir, None);
         assert!(kc.keys.is_empty());
     }
 
@@ -516,7 +589,7 @@ mod tests {
             "alice 6 JBSWY3DPEHPK3PXP\nbob 6 JBSWY3DPEHPK3PXP\n",
         )
         .unwrap();
-        let kc = read_keychain(&dir);
+        let kc = read_keychain(&dir, None);
         let names: Vec<&String> = kc.keys.keys().collect();
         assert_eq!(names, vec!["alice", "bob"]);
         let _ = fs::remove_file(&dir);
@@ -528,10 +601,95 @@ mod tests {
         let dir = std::env::temp_dir().join("test_2fa_code_fmt");
         let _ = fs::remove_file(&dir);
         fs::write(&dir, "test 6 JBSWY3DPEHPK3PXP\n").unwrap();
-        let kc = read_keychain(&dir);
+        let kc = read_keychain(&dir, None);
         let code = kc.code("test");
         assert_eq!(code.len(), 6);
         assert!(code.chars().all(|c| c.is_ascii_digit()));
+        let _ = fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn test_derive_key() {
+        let key1 = derive_key("mysecretpassword");
+        let key2 = derive_key("mysecretpassword");
+        assert_eq!(key1, key2); // deterministic
+        assert_eq!(key1.len(), 32);
+
+        let key3 = derive_key("differentpassword");
+        assert_ne!(key1, key3); // different inputs produce different keys
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_roundtrip() {
+        let key = derive_key("testkey");
+        let plaintext = "JBSWY3DPEHPK3PXP";
+        let encrypted = encrypt_secret(plaintext, &key);
+        assert!(encrypted.starts_with(ENC_PREFIX));
+        let decrypted = decrypt_secret(&encrypted, &key).expect("decryption should succeed");
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_encrypt_produces_different_ciphertext() {
+        // Each encryption with the same key produces a different ciphertext (random nonce)
+        let key = derive_key("testkey");
+        let plaintext = "JBSWY3DPEHPK3PXP";
+        let enc1 = encrypt_secret(plaintext, &key);
+        let enc2 = encrypt_secret(plaintext, &key);
+        assert_ne!(enc1, enc2); // different nonces
+    }
+
+    #[test]
+    fn test_decrypt_wrong_key() {
+        let key1 = derive_key("correctkey");
+        let key2 = derive_key("wrongkey");
+        let encrypted = encrypt_secret("JBSWY3DPEHPK3PXP", &key1);
+        let result = decrypt_secret(&encrypted, &key2);
+        assert!(result.is_none()); // wrong key should fail
+    }
+
+    #[test]
+    fn test_decrypt_not_encrypted() {
+        let key = derive_key("testkey");
+        // A plaintext secret (no enc: prefix) should return None
+        let result = decrypt_secret("JBSWY3DPEHPK3PXP", &key);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_read_keychain_with_encrypted_secret() {
+        let dir = std::env::temp_dir().join("test_2fa_enc_totp");
+        let _ = fs::remove_file(&dir);
+        let enc_key = derive_key("mypassword");
+        let encrypted_secret = encrypt_secret("JBSWY3DPEHPK3PXP", &enc_key);
+        fs::write(&dir, format!("github 6 {}\n", encrypted_secret)).unwrap();
+
+        // Read with the correct key
+        let kc = read_keychain(&dir, Some(&enc_key));
+        assert!(kc.keys.contains_key("github"));
+
+        // Read without a key — encrypted entry won't decode as valid base32
+        let kc_no_key = read_keychain(&dir, None);
+        assert!(!kc_no_key.keys.contains_key("github"));
+
+        let _ = fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn test_read_keychain_plaintext_with_no_key() {
+        let dir = std::env::temp_dir().join("test_2fa_plain_nokey");
+        let _ = fs::remove_file(&dir);
+        fs::write(&dir, "github 6 JBSWY3DPEHPK3PXP\n").unwrap();
+
+        // Read with no encryption key — should work fine
+        let kc = read_keychain(&dir, None);
+        assert!(kc.keys.contains_key("github"));
+
+        // Read with an encryption key but plaintext secret — also works (treated as plaintext)
+        let enc_key = derive_key("somekey");
+        let kc_with_key = read_keychain(&dir, Some(&enc_key));
+        assert!(kc_with_key.keys.contains_key("github"));
+
         let _ = fs::remove_file(&dir);
     }
 }
