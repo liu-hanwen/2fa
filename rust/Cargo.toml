@@ -1,0 +1,11 @@
+[package]
+name = "twofa"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hmac = "0.12"
+sha1 = "0.10"
+data-encoding = "2.6"
+clap = { version = "4.5", features = ["derive"] }
+arboard = "3.4"
