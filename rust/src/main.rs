@@ -455,7 +455,7 @@ mod tests {
         let hotp_code = hotp(key, 0, 6);
         assert_eq!(totp_code, hotp_code);
 
-        // TOTP at time 59 should still be counter 1 (59/30 = 1)
+        // TOTP at time 59 should be counter 1 (59/30 = 1, integer division)
         let totp_code = totp(key, 59, 6);
         let hotp_code = hotp(key, 1, 6);
         assert_eq!(totp_code, hotp_code);
